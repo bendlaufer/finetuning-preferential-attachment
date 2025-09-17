@@ -133,7 +133,7 @@ def plot_empirical_attachment_analysis(attachment_events, empirical_probs, degre
 
     fig, axes = plt.subplots(2, 1, figsize=(15, 6))
     
-    # 1: Empirical attachment probability vs degree
+  
     axes[0].errorbar(filtered_degrees, filtered_probs, yerr=conf_intervals, 
                        fmt='o-', capsize=5, alpha=0.8, linewidth=2, markersize=6)
     axes[0].set_xlabel('Degree at Time of Attachment')
@@ -142,20 +142,20 @@ def plot_empirical_attachment_analysis(attachment_events, empirical_probs, degre
     axes[0].grid(True, alpha=0.3)
     
     if filtered_degrees:
-        # Linear preferential attachment: P ∝ (degree + 1)
+        # Linear: P ∝ (degree + 1)
         theoretical_linear = np.array(filtered_degrees) + 1
         theoretical_linear = theoretical_linear / np.sum(theoretical_linear) * len(filtered_degrees) * np.mean(filtered_probs)
         axes[0].plot(filtered_degrees, theoretical_linear, 'r--', 
                       label='Linear PA (∝ degree + 1)', alpha=0.7, linewidth=2)
         
-        # Uniform attachment: P = constant
+        # Uniform: P = constant
         uniform_prob = np.mean(filtered_probs)
         axes[0].axhline(y=uniform_prob, color='g', linestyle='--', 
                          label=f'Uniform (P = {uniform_prob:.4f})', alpha=0.7, linewidth=2)
         
         axes[0].legend()
     
-    # 2: Log-log plot
+
     log_degrees = []
     log_probs = []
     
