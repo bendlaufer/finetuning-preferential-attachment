@@ -18,7 +18,7 @@ def parse_licenses(license_str):
         license_name = license_name.strip() 
         license_name = license_name.strip("'")
         if len(license_name) > 0:
-            licenses.append(license_name)
+            licenses.append(license_name) 
     return licenses
 
 def precompute_graph_data(G):
@@ -315,6 +315,6 @@ if __name__ == "__main__":
  
     # attachment_events, empirical_probs, degree_opportunities, degree_chosen = analyze_empirical_attachment_probs(G, sample_size=sample_size)
     # empirical_probs, degree_opportunities, degree_chosen = analyze_with_balanced_negative_sampling(G, sample_size=1000, negatives_per_degree=2)
-    empirical_probs, degree_opportunities, degree_chosen = analyze_empirical_attachment_probs(G, sample_size=None, negative_sample_ratio=20)
+    empirical_probs, degree_opportunities, degree_chosen = analyze_empirical_attachment_probs(G, sample_size=5000, negative_sample_ratio=20)
     plot_empirical_attachment_analysis(empirical_probs, degree_opportunities, degree_chosen, min_opportunities=11)
    
