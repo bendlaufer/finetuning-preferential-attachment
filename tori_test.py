@@ -2,19 +2,29 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import networkx as nx
-import random
 from datetime import datetime
-from collections import defaultdict, Counter
-import json
+from collections import defaultdict
+import bisect
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 def parse_date(date_str):
     return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
 
-def analyze_empirical_attachment_probs(G, sample_size=None):
+def parse_licenses(license_str):
+    licenses = []
+    license_str = license_str.strip('[]')
+    for license_name in license_str.split(','):
+        license_name = license_name.strip() 
+        license_name = license_name.strip("'")
+        if len(license_name) > 0:
+            licenses.append(license_name)
+    return licenses
+
+def precompute_graph_data(G):
     """
-    P(attach to degree k) = (times degree k was chosen) / (times degree k was available)
+    Precompute adjacency with neighbor timestamps for faster degree calculation / lookups
     """
-        
     node_dates = {}
     for node, attrs in G.nodes.data():
         if 'createdAt' in attrs:
@@ -22,89 +32,147 @@ def analyze_empirical_attachment_probs(G, sample_size=None):
                 node_dates[node] = parse_date(attrs['createdAt'])
             except:
                 continue
+    
+    adjacency_with_dates = {}
+    for node in G.nodes():
+        neighbors = set(G.predecessors(node)) | set(G.successors(node))
+        adjacency_with_dates[node] = [
+            (neighbor, node_dates.get(neighbor)) 
+            for neighbor in neighbors 
+            if neighbor in node_dates
+        ]
+    
+    return node_dates, adjacency_with_dates
+
+def compute_degree_at_time_fast(neighbor_date_pairs, attachment_time):
+    return sum(1 for _, date in neighbor_date_pairs if date < attachment_time)
+
+def process_edge_chunk(edge_chunk, node_array, date_array, adjacency_with_dates, negative_sample_ratio):
+    """
+    Process a chunk of edges in parallel.
+    Returns: 
+        - local degree opportunities 
+        - degree chosen counts
+    """
+    local_opportunities = defaultdict(int)
+    local_chosen = defaultdict(int)
+    
+    for attachment_time, newer_node, target_node in edge_chunk:
+        # Binary search to find available nodes
+        idx = bisect.bisect_left(date_array, attachment_time)
+        mask = node_array[:idx] != newer_node
+        available_nodes = node_array[:idx][mask]
         
-    edges_with_dates = []
-    for u, v in G.edges():
-        if u in node_dates and v in node_dates:
-            u_date = node_dates[u]
-            v_date = node_dates[v]
+        if len(available_nodes) < 2:
+            continue
+        
+        # Compute target degree (positive sample)
+        if target_node in adjacency_with_dates:
+            target_degree = compute_degree_at_time_fast(
+                adjacency_with_dates[target_node], attachment_time
+            )
+            local_chosen[target_degree] += 1
+            local_opportunities[target_degree] += 1
+        
+        # Sample negatives
+        non_target_mask = available_nodes != target_node
+        non_target_nodes = available_nodes[non_target_mask]
+        
+        if len(non_target_nodes) == 0:
+            continue
             
-            if u_date != v_date: 
-                # (attachment_time, newer_node, older_node)
-                if u_date < v_date:
-                    edges_with_dates.append((v_date, v, u))  # v attached to u
-                else:
-                    edges_with_dates.append((u_date, u, v))  # u attached to v
+        num_negatives = min(negative_sample_ratio, len(non_target_nodes))
+        negative_indices = np.random.choice(len(non_target_nodes), num_negatives, replace=False)
+        
+        for idx in negative_indices:
+            neg_node = non_target_nodes[idx]
+            if neg_node in adjacency_with_dates:
+                neg_degree = compute_degree_at_time_fast(
+                    adjacency_with_dates[neg_node], attachment_time
+                )
+                local_opportunities[neg_degree] += 1
+    
+    return dict(local_opportunities), dict(local_chosen)
+
+def analyze_empirical_attachment_probs(G, sample_size=None, negative_sample_ratio=5, n_jobs=None):
+    """
+    Parallel version using multiprocessing for very large graphs.
+    
+    Args:
+        G: NetworkX graph
+        sample_size: Number of edges to sample (None = use all)
+        negative_sample_ratio: Number of negative samples per positive
+        n_jobs: Number of parallel workers (None = use all CPU cores)
+    
+    Returns:
+        empirical_probs: Dictionary of degree -> attachment probability
+        degree_opportunities: Dictionary of degree -> number of times available
+        degree_chosen: Dictionary of degree -> number of times chosen
+    """
+    if n_jobs is None:
+        n_jobs = cpu_count()
+    
+    # print(f"Using {n_jobs} parallel workers...")
+    
+
+    node_dates, adjacency_with_dates = precompute_graph_data(G)
+
+    edges_with_dates = [
+        (v_date, v, u) if u_date < v_date else (u_date, u, v)
+        for u, v in G.edges()
+        if (u_date := node_dates.get(u)) and (v_date := node_dates.get(v)) and u_date != v_date
+    ]
     
     edges_with_dates.sort(key=lambda x: x[0])
     
     if sample_size and len(edges_with_dates) > sample_size:
-        sampled_indices = sorted(random.sample(range(len(edges_with_dates)), sample_size))
-        edges_with_dates = [edges_with_dates[i] for i in sampled_indices]
+        sampled_indices = np.random.choice(len(edges_with_dates), sample_size, replace=False)
+        edges_with_dates = [edges_with_dates[i] for i in sorted(sampled_indices)]
     
-    degree_opportunities = defaultdict(int)  # Times each degree was available
-    degree_chosen = defaultdict(int)         # Times each degree was actually chosen
+    # print(f"Processing {len(edges_with_dates)} edges...")
     
-    attachment_events = []
+    sorted_nodes = sorted(node_dates.items(), key=lambda x: x[1])
+    node_array = np.array([n[0] for n in sorted_nodes], dtype=object)
+    date_array = np.array([n[1] for n in sorted_nodes])
     
-    for i, (attachment_time, newer_node, target_node) in enumerate(edges_with_dates):
-        # Find all nodes that existed before this attachment time
-        available_nodes = []
-        for node, creation_date in node_dates.items():
-            if creation_date < attachment_time and node != newer_node:
-                available_nodes.append(node)
-        
-        if len(available_nodes) < 2:  
-            continue
-            
-        # Calculate degree of each available node at attachment time
-        node_degrees_at_time = {}
-        
-        for node in available_nodes:
-            degree_at_time = 0
-            all_neighbors = set(G.predecessors(node)) | set(G.successors(node))
-            
-            for neighbor in all_neighbors:
-                if neighbor in node_dates and node_dates[neighbor] < attachment_time:
-                    degree_at_time += 1
-            
-            node_degrees_at_time[node] = degree_at_time
-        
-        for node, degree in node_degrees_at_time.items():
-            degree_opportunities[degree] += 1
-        
-        if target_node in node_degrees_at_time:
-            target_degree = node_degrees_at_time[target_node]
-            degree_chosen[target_degree] += 1
-            
-            attachment_events.append({
-                'target_node': target_node,
-                'newer_node': newer_node,
-                'target_degree': target_degree,
-                'attachment_time': attachment_time,
-                'num_choices_available': len(available_nodes),
-                'available_degrees': list(node_degrees_at_time.values()),
-                'mean_available_degree': np.mean(list(node_degrees_at_time.values())),
-                'max_available_degree': max(node_degrees_at_time.values()) if node_degrees_at_time else 0
-            })
-    
-    empirical_probs = {}
-    degree_counts = {}
-    
-    for degree in degree_opportunities.keys():
-        opportunities = degree_opportunities[degree]
-        chosen = degree_chosen[degree]
-        
-        if opportunities > 0:
-            empirical_probs[degree] = chosen / opportunities
-            degree_counts[degree] = chosen
-        else:
-            empirical_probs[degree] = 0
-            degree_counts[degree] = 0
-    
-    return attachment_events, empirical_probs, degree_opportunities, degree_chosen
 
-def plot_empirical_attachment_analysis(attachment_events, empirical_probs, degree_opportunities, degree_chosen, min_opportunities=5):
+    chunk_size = max(1, len(edges_with_dates) // n_jobs)
+    chunks = [edges_with_dates[i:i + chunk_size] for i in range(0, len(edges_with_dates), chunk_size)]
+    
+    print(f"Split into {len(chunks)} chunks of ~{chunk_size} edges each")
+    
+    process_func = partial(
+        process_edge_chunk,
+        node_array=node_array,
+        date_array=date_array,
+        adjacency_with_dates=adjacency_with_dates,
+        negative_sample_ratio=negative_sample_ratio
+    )
+    
+    with Pool(n_jobs) as pool:
+        results = pool.map(process_func, chunks)
+    
+    # Merge results from all workers
+    degree_opportunities = defaultdict(int)
+    degree_chosen = defaultdict(int)
+    
+    for local_opp, local_chosen in results:
+        for degree, count in local_opp.items():
+            degree_opportunities[degree] += count
+        for degree, count in local_chosen.items():
+            degree_chosen[degree] += count
+    
+    empirical_probs = {
+        degree: degree_chosen[degree] / degree_opportunities[degree]
+        for degree in degree_opportunities.keys()
+        if degree_opportunities[degree] > 0
+    }
+    
+    print(f"Analyzed {len(degree_opportunities)} unique degree values")
+    
+    return empirical_probs, degree_opportunities, degree_chosen
+
+def plot_empirical_attachment_analysis(empirical_probs, degree_opportunities, degree_chosen, min_opportunities=5):
     
     filtered_degrees = []
     filtered_probs = []
@@ -194,25 +262,59 @@ def plot_empirical_attachment_analysis(attachment_events, empirical_probs, degre
     
     return filtered_degrees, filtered_probs, filtered_opportunities
 
+# def plot_license_data(G):
+#     license_children = defaultdict(list)
+#     for node_name in G.nodes:
+#         node = G.nodes[node_name]
+#         licenses = parse_licenses(node['licenses'])
+#         for license in licenses:
+#             license_children[license].append(len(set(G.successors(node_name))))
+    
+
+#     avgs = defaultdict(int)
+#     for license in license_children:
+#         avg = sum(license_children[license]) / len(license_children[license])
+#         if avg > 0.01:
+#             avgs[license] = avg
+
+#     fig, ax = plt.subplots(1,1,figsize=(25, 12))
+
+#     licenses = avgs.keys() 
+#     counts = avgs.values()
+#     ax.bar(licenses, counts, label=licenses)
+#     print(licenses)
+#     ax.set_ylabel('Average # of Children')
+#     ax.set_title('Avg. Counts by License')
+#     # ax.legend(title='License Name')
+#     ax.tick_params(axis='x', labelrotation=35)
+
+#     plt.savefig('license_counts.png')
+
+
+
 if __name__ == "__main__":
+    """
+    Example node: 
+
+    moonshotai/Kimi-K2-Instruct: {'likes': 479, 'downloads': 13356, 'pipeline_tag': 'text-generation', 
+        'library_name': 'transformers', 'createdAt': '2025-07-11T00:55:12.000Z', 'licenses': "['other']", 
+        'datasets': '[]', 'languages': '[]'}
+
+        
+    Example edge:
+
+    (moonshotai/Kimi-K2-Instruct, yujiepan/kimi-k2-tiny-random): {'edge_types': ['finetune'], 
+        'edge_type': 'finetune', 'change_in_likes': -478, 'percentage_change_in_likes': -0.9979123173277662, 
+        'change_in_downloads': -13356, 'percentage_change_in_downloads': -1.0, 'change_in_createdAt_days': 1}
+    """
+    
     G = pickle.load(open('data/ai_ecosystem_graph_finetune.pkl', 'rb'))
     
-    sample_size = 1000  
-    attachment_events, empirical_probs, degree_opportunities, degree_chosen = analyze_empirical_attachment_probs(G, sample_size=sample_size)
-    
-    if attachment_events:
-        degrees, probs, opportunities = plot_empirical_attachment_analysis(
-            attachment_events, empirical_probs, degree_opportunities, degree_chosen, min_opportunities=5)
-        
-        # results = {
-        #     'attachment_events': len(attachment_events),
-        #     'empirical_probabilities': empirical_probs,
-        #     'degree_opportunities': dict(degree_opportunities),
-        #     'degree_chosen': dict(degree_chosen)
-        # }
-        
-        # with open("empirical_attachment_analysis.json", "w") as f:
-        #     json.dump(results, f, indent=2)
-        
-    else:
-        print("No attachment events found.")
+    # plot_license_data(G)
+   
+ 
+    # attachment_events, empirical_probs, degree_opportunities, degree_chosen = analyze_empirical_attachment_probs(G, sample_size=sample_size)
+    # empirical_probs, degree_opportunities, degree_chosen = analyze_with_balanced_negative_sampling(G, sample_size=1000, negatives_per_degree=2)
+    empirical_probs, degree_opportunities, degree_chosen = analyze_empirical_attachment_probs(G, sample_size=None, negative_sample_ratio=20)
+    plot_empirical_attachment_analysis(empirical_probs, degree_opportunities, degree_chosen, min_opportunities=11)
+   
